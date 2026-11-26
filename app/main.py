@@ -1,5 +1,5 @@
 """
-Мини-магазин: FastAPI + PostgreSQL.
+Мини-магазин: FastAPI + PostgreSQL + Redis.
 """
 import asyncio
 import os
@@ -7,12 +7,21 @@ import socket
 from contextlib import asynccontextmanager
 
 import asyncpg
-from fastapi import FastAPI, HTTPException, Query, Request
+import redis.asyncio as redis
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
+from cache import Cache
+
 # --- Настройки из переменных окружения ---
-# По умолчанию — база на этом компьютере (для запуска без Docker)
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://shop:shop@localhost:5432/shop")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://shop:shop@localhost:5433/shop")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+CACHE_ENABLED = os.getenv("CACHE_ENABLED", "1") == "1"
+# Время жизни ключей, секунды
+TTL_PRODUCT = 60
+TTL_LIST = 30
+TTL_TOP = 30
+
 DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
 # Имитация медленного платёжного шлюза
 PAYMENT_DELAY = float(os.getenv("PAYMENT_DELAY_SEC", "0.2"))
@@ -21,10 +30,11 @@ INSTANCE = os.getenv("INSTANCE_NAME") or socket.gethostname()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Выполняется при старте приложения: создаём пул соединений
     app.state.db = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=DB_POOL_MAX)
+    app.state.redis = redis.from_url(REDIS_URL, decode_responses=True)
+    app.state.cache = Cache(app.state.redis, enabled=CACHE_ENABLED)
     yield
-    # При остановке — закрываем его
+    await app.state.redis.aclose()
     await app.state.db.close()
 
 
@@ -33,7 +43,6 @@ app = FastAPI(title="Мини-магазин", lifespan=lifespan)
 
 @app.middleware("http")
 async def add_instance_header(request: Request, call_next):
-    # К каждому ответу добавляем имя воркера
     response = await call_next(request)
     response.headers["X-Instance"] = INSTANCE
     return response
@@ -52,6 +61,7 @@ async def index():
 @app.get("/health")
 async def health():
     await app.state.db.fetchval("SELECT 1")
+    await app.state.redis.ping()
     return {"status": "ok", "instance": INSTANCE}
 
 
@@ -68,10 +78,17 @@ async def search_products(q: str = Query(min_length=2, max_length=50),
 
 
 @app.get("/products")
-async def list_products(category_id: int = Query(1, ge=1),
+async def list_products(response: Response,
+                        category_id: int = Query(1, ge=1),
                         limit: int = Query(20, ge=1, le=100),
                         offset: int = Query(0, ge=0, le=10000)):
     """Товары категории, сначала самые дорогие."""
+    key = f"products:cat:{category_id}:{limit}:{offset}"
+    cached = await app.state.cache.get(key)
+    if cached is not None:
+        response.headers["X-Cache"] = "HIT"
+        return cached
+
     rows = await app.state.db.fetch(
         """SELECT id, name, price, stock FROM products
            WHERE category_id = $1
@@ -79,14 +96,21 @@ async def list_products(category_id: int = Query(1, ge=1),
            LIMIT $2 OFFSET $3""",
         category_id, limit, offset,
     )
-    return [dict(r) for r in rows]
+    data = [dict(r) for r in rows]
+    await app.state.cache.set(key, data, TTL_LIST)
+    response.headers["X-Cache"] = "MISS"
+    return data
 
 
 @app.get("/products/{product_id}")
-async def get_product(product_id: int):
-    # $1 — параметр запроса. Никогда не вставляйте значения в SQL
-    # через f-строки — это SQL-инъекция.
-    row = await app.state.db.fetchrow(
+async def get_product(product_id: int, response: Response):
+    key = f"product:{product_id}"
+    cached = await app.state.cache.get(key)          # 1. ищем в кэше
+    if cached is not None:
+        response.headers["X-Cache"] = "HIT"
+        return cached
+
+    row = await app.state.db.fetchrow(              # 2. читаем из БД
         """SELECT p.id, p.name, p.description, p.price, p.stock, c.name AS category
            FROM products p JOIN categories c ON c.id = p.category_id
            WHERE p.id = $1""",
@@ -94,12 +118,21 @@ async def get_product(product_id: int):
     )
     if row is None:
         raise HTTPException(404, "Товар не найден")
-    return dict(row)
+    data = dict(row)
+    await app.state.cache.set(key, data, TTL_PRODUCT)  # 3. кладём в кэш
+    response.headers["X-Cache"] = "MISS"
+    return data
 
 
 @app.get("/stats/top-products")
-async def top_products():
+async def top_products(response: Response):
     """Топ-10 продаваемых товаров за неделю — «тяжёлый» запрос."""
+    key = "stats:top-products"
+    cached = await app.state.cache.get(key)
+    if cached is not None:
+        response.headers["X-Cache"] = "HIT"
+        return cached
+
     rows = await app.state.db.fetch(
         """SELECT p.id, p.name, t.sold
            FROM (SELECT product_id, sum(quantity) AS sold
@@ -111,7 +144,10 @@ async def top_products():
            JOIN products p ON p.id = t.product_id
            ORDER BY t.sold DESC"""
     )
-    return [dict(r) for r in rows]
+    data = [dict(r) for r in rows]
+    await app.state.cache.set(key, data, TTL_TOP)
+    response.headers["X-Cache"] = "MISS"
+    return data
 
 
 @app.post("/orders", status_code=201)
@@ -120,7 +156,6 @@ async def create_order(order: OrderIn):
 
     async with app.state.db.acquire() as conn:
         async with conn.transaction():
-            # FOR UPDATE блокирует строку: два покупателя не купят один товар
             product = await conn.fetchrow(
                 "SELECT price, stock FROM products WHERE id = $1 FOR UPDATE",
                 order.product_id,
@@ -140,6 +175,8 @@ async def create_order(order: OrderIn):
                    RETURNING id, product_id, quantity, total, status, created_at""",
                 order.product_id, order.quantity, product["price"] * order.quantity,
             )
+    # Остаток товара изменился — удаляем устаревшую карточку
+    await app.state.cache.delete(f"product:{order.product_id}")
     return dict(row)
 
 
@@ -154,4 +191,3 @@ async def get_order(order_id: int):
     if row is None:
         raise HTTPException(404, "Заказ не найден")
     return dict(row)
-
