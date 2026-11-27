@@ -1,7 +1,6 @@
 """
-Мини-магазин: FastAPI + PostgreSQL + Redis.
+Мини-магазин: FastAPI + PostgreSQL + Redis Cluster + RabbitMQ.
 """
-import asyncio
 import os
 import socket
 from contextlib import asynccontextmanager
@@ -12,30 +11,29 @@ from pydantic import BaseModel, Field
 from redis.asyncio.cluster import RedisCluster
 
 from cache import Cache
+import mq
 
 # --- Настройки из переменных окружения ---
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://shop:shop@localhost:5433/shop")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+REDIS_URL = os.getenv("REDIS_URL", "redis://172.30.0.11:6379")
 CACHE_ENABLED = os.getenv("CACHE_ENABLED", "1") == "1"
-# Время жизни ключей, секунды
 TTL_PRODUCT = 60
 TTL_LIST = 30
 TTL_TOP = 30
 
 DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
-# Имитация медленного платёжного шлюза
-PAYMENT_DELAY = float(os.getenv("PAYMENT_DELAY_SEC", "0.2"))
 INSTANCE = os.getenv("INSTANCE_NAME") or socket.gethostname()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.db = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=DB_POOL_MAX)
-    # Достаточно ОДНОГО узла — остальные клиент узнает от него сам
     app.state.redis = RedisCluster.from_url(REDIS_URL, decode_responses=True)
     await app.state.redis.initialize()
     app.state.cache = Cache(app.state.redis, enabled=CACHE_ENABLED)
+    app.state.mq_conn, app.state.mq_channel, _ = await mq.connect()
     yield
+    await app.state.mq_conn.close()
     await app.state.redis.aclose()
     await app.state.db.close()
 
@@ -81,8 +79,6 @@ async def cache_node(product_id: int):
     }
 
 
-# ВАЖНО: /products/search объявляем РАНЬШЕ /products/{product_id},
-# иначе FastAPI сочтёт слово "search" номером товара.
 @app.get("/products/search")
 async def search_products(q: str = Query(min_length=2, max_length=50),
                           limit: int = Query(20, ge=1, le=100)):
@@ -121,12 +117,12 @@ async def list_products(response: Response,
 @app.get("/products/{product_id}")
 async def get_product(product_id: int, response: Response):
     key = f"product:{product_id}"
-    cached = await app.state.cache.get(key)          # 1. ищем в кэше
+    cached = await app.state.cache.get(key)
     if cached is not None:
         response.headers["X-Cache"] = "HIT"
         return cached
 
-    row = await app.state.db.fetchrow(              # 2. читаем из БД
+    row = await app.state.db.fetchrow(
         """SELECT p.id, p.name, p.description, p.price, p.stock, c.name AS category
            FROM products p JOIN categories c ON c.id = p.category_id
            WHERE p.id = $1""",
@@ -135,7 +131,7 @@ async def get_product(product_id: int, response: Response):
     if row is None:
         raise HTTPException(404, "Товар не найден")
     data = dict(row)
-    await app.state.cache.set(key, data, TTL_PRODUCT)  # 3. кладём в кэш
+    await app.state.cache.set(key, data, TTL_PRODUCT)
     response.headers["X-Cache"] = "MISS"
     return data
 
@@ -166,10 +162,8 @@ async def top_products(response: Response):
     return data
 
 
-@app.post("/orders", status_code=201)
+@app.post("/orders", status_code=202)        # 202 Accepted — «принято в обработку»
 async def create_order(order: OrderIn):
-    await asyncio.sleep(PAYMENT_DELAY)  # имитация платёжного шлюза
-
     async with app.state.db.acquire() as conn:
         async with conn.transaction():
             product = await conn.fetchrow(
@@ -186,12 +180,13 @@ async def create_order(order: OrderIn):
                 order.quantity, order.product_id,
             )
             row = await conn.fetchrow(
-                """INSERT INTO orders (product_id, quantity, total, status, processed_at)
-                   VALUES ($1, $2, $3, 'processed', now())
+                """INSERT INTO orders (product_id, quantity, total, status)
+                   VALUES ($1, $2, $3, 'pending')
                    RETURNING id, product_id, quantity, total, status, created_at""",
                 order.product_id, order.quantity, product["price"] * order.quantity,
             )
-    # Остаток товара изменился — удаляем устаревшую карточку
+    # Публикуем ПОСЛЕ коммита: consumer должен найти заказ в БД
+    await mq.publish(app.state.mq_channel, {"order_id": row["id"]})
     await app.state.cache.delete(f"product:{order.product_id}")
     return dict(row)
 
