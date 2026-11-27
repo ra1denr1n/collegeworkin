@@ -7,9 +7,9 @@ import socket
 from contextlib import asynccontextmanager
 
 import asyncpg
-import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
+from redis.asyncio.cluster import RedisCluster
 
 from cache import Cache
 
@@ -31,7 +31,9 @@ INSTANCE = os.getenv("INSTANCE_NAME") or socket.gethostname()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.db = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=DB_POOL_MAX)
-    app.state.redis = redis.from_url(REDIS_URL, decode_responses=True)
+    # Достаточно ОДНОГО узла — остальные клиент узнает от него сам
+    app.state.redis = RedisCluster.from_url(REDIS_URL, decode_responses=True)
+    await app.state.redis.initialize()
     app.state.cache = Cache(app.state.redis, enabled=CACHE_ENABLED)
     yield
     await app.state.redis.aclose()
@@ -63,6 +65,20 @@ async def health():
     await app.state.db.fetchval("SELECT 1")
     await app.state.redis.ping()
     return {"status": "ok", "instance": INSTANCE}
+
+
+@app.get("/admin/cache-node/{product_id}")
+async def cache_node(product_id: int):
+    """На каком узле кластера лежит ключ товара."""
+    key = f"product:{product_id}"
+    rc = app.state.redis
+    node = rc.get_node_from_key(key)
+    return {
+        "key": key,
+        "hash_slot": rc.keyslot(key),
+        "node": f"{node.host}:{node.port}",
+        "cached": await rc.exists(key) == 1,
+    }
 
 
 # ВАЖНО: /products/search объявляем РАНЬШЕ /products/{product_id},
