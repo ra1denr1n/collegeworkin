@@ -202,17 +202,76 @@ services:
     image: nginx:1.27-alpine
     volumes:
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
-    ports:
-      - "8080:80"
     depends_on: [app1, app2, app3]
     mem_limit: 64m
+    networks: [backend]
+
+  edge:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./edge/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./edge/static:/usr/share/nginx/html/static:ro
+    ports:
+      - "8080:80"
+    depends_on: [lb]
+    mem_limit: 128m
+    networks: [backend]
+
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: ["monitoring"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+    ports: ["9090:9090"]
+    mem_limit: 200m
+    networks: [backend]
+
+  grafana:
+    image: grafana/grafana:latest
+    profiles: ["monitoring"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+    mem_limit: 200m
+    networks: [backend]
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:latest
+    profiles: ["monitoring"]
+    environment:
+      DATA_SOURCE_NAME: postgresql://shop:shop@pg-primary:5432/shop?sslmode=disable
+    mem_limit: 64m
+    networks: [backend]
+
+  redis-exporter:
+    image: oliver006/redis_exporter:latest
+    profiles: ["monitoring"]
+    environment:
+      REDIS_ADDR: redis://172.30.0.11:6379
+      REDIS_EXPORTER_IS_CLUSTER: "true"
+    mem_limit: 64m
+    networks: [backend]
+
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:latest
+    profiles: ["monitoring"]
+    command: ["--nginx.scrape-uri=http://lb/stub_status"]
+    depends_on: [lb]
+    mem_limit: 32m
     networks: [backend]
 
   k6:
     image: grafana/k6:latest
     profiles: ["test"]
     environment:
-      BASE_URL: http://lb
+      BASE_URL: http://edge
     volumes:
       - ./k6:/scripts:ro
     networks: [backend]

@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Мини-магазин</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="container">
+    <h1>Мини-магазин</h1>
+
+    <div class="controls">
+      <label for="category">Категория:</label>
+      <select id="category"></select>
+      <button id="reload">Обновить</button>
+    </div>
+
+    <div class="headers-box" id="headers">
+      Заголовки ответа: <code>X-Cache-Status: -</code> | <code>X-Cache: -</code> | <code>X-Instance: -</code>
+    </div>
+
+    <div class="status" id="order-status"></div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Название</th>
+          <th>Цена</th>
+          <th>Остаток</th>
+          <th>Действие</th>
+        </tr>
+      </thead>
+      <tbody id="products"></tbody>
+    </table>
+  </div>
+
+  <script>
+    const categoryEl = document.getElementById('category');
+    const tbody = document.getElementById('products');
+    const headersEl = document.getElementById('headers');
+    const statusEl = document.getElementById('order-status');
+
+    for (let i = 1; i <= 50; i++) {
+      const opt = document.createElement('option');
+      opt.value = i;
+      opt.textContent = `Категория ${i}`;
+      categoryEl.appendChild(opt);
+    }
+
+    function showHeaders(res) {
+      const edge = res.headers.get('X-Cache-Status') || '-';
+      const redis = res.headers.get('X-Cache') || '-';
+      const inst = res.headers.get('X-Instance') || '-';
+      headersEl.innerHTML =
+        `Заголовки ответа: <code>X-Cache-Status: ${edge}</code> | ` +
+        `<code>X-Cache: ${redis}</code> | <code>X-Instance: ${inst}</code>`;
+    }
+
+    async function loadProducts() {
+      const cat = categoryEl.value;
+      const res = await fetch(`/products?category_id=${cat}&limit=20`);
+      showHeaders(res);
+      const items = await res.json();
+      tbody.innerHTML = items.map(p => `
+        <tr>
+          <td>${p.id}</td>
+          <td>${p.name}</td>
+          <td>${Number(p.price).toFixed(2)} ₽</td>
+          <td>${p.stock}</td>
+          <td><button onclick="buy(${p.id})">Купить</button></td>
+        </tr>
+      `).join('');
+    }
+
+    async function buy(productId) {
+      statusEl.textContent = `Оформляем заказ на товар #${productId}...`;
+      const res = await fetch('/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ product_id: productId, quantity: 1 }),
+      });
+      showHeaders(res);
+      const data = await res.json();
+      if (res.ok) {
+        statusEl.textContent = `Заказ #${data.id} принят (status: ${data.status}, сумма: ${data.total} ₽)`;
+      } else {
+        statusEl.textContent = `Ошибка: ${data.detail || res.status}`;
+      }
+    }
+
+    categoryEl.addEventListener('change', loadProducts);
+    document.getElementById('reload').addEventListener('click', loadProducts);
+    loadProducts();
+  </script>
+</body>
+</html>

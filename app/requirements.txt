@@ -3,3 +3,4 @@ uvicorn
 asyncpg
 redis>=5.0.1
 aio-pika>=9.4
+prometheus-client>=0.20

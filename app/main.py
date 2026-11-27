@@ -3,9 +3,12 @@
 """
 import os
 import socket
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import PlainTextResponse
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from pydantic import BaseModel, Field
 from redis.asyncio.cluster import RedisCluster
 
@@ -40,11 +43,38 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Мини-магазин", lifespan=lifespan)
 
 
+REQUESTS = Counter(
+    "app_requests_total", "Количество HTTP-запросов", ["method", "route", "status"]
+)
+LATENCY = Histogram(
+    "app_request_duration_seconds",
+    "Время обработки запроса",
+    ["method", "route"],
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5),
+)
+CACHE_RESULTS = Counter("app_cache_total", "Попадания и промахи кэша", ["result"])
+
+
 @app.middleware("http")
-async def add_instance_header(request: Request, call_next):
+async def metrics_and_instance(request: Request, call_next):
+    start = time.perf_counter()
     response = await call_next(request)
+    # Шаблон маршрута (/products/{product_id}), а не реальный путь —
+    # иначе у метрики будут сотни тысяч вариантов меток
+    route = request.scope.get("route")
+    path = getattr(route, "path", "unknown")
+    if path != "/metrics":
+        LATENCY.labels(request.method, path).observe(time.perf_counter() - start)
+        REQUESTS.labels(request.method, path, str(response.status_code)).inc()
+        if "X-Cache" in response.headers:
+            CACHE_RESULTS.labels(response.headers["X-Cache"].lower()).inc()
     response.headers["X-Instance"] = INSTANCE
     return response
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics():
+    return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 class OrderIn(BaseModel):
